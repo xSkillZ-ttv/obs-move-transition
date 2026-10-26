@@ -1,0 +1,16 @@
+{
+  "display_name": "Move (OBS 33 fork)",
+  "id": "com.github.xSkillZ-ttv.obs-move-transition",
+  "version": "@PROJECT_VERSION@",
+  "os_arch": "windows-x64",
+  "name": "move-transition",
+  "description": "Move transitions and filters, with OBS 33 Windows packaging and preventive bug fixes.",
+  "long_description": "Community fork of Exeldro's Move Transition. Preserves the original source and filter identifiers.",
+  "urls": {
+    "repository": "https://github.com/xSkillZ-ttv/obs-move-transition",
+    "website": "https://github.com/xSkillZ-ttv/obs-move-transition",
+    "support": "https://github.com/xSkillZ-ttv/obs-move-transition/issues"
+  },
+  "has_banner": false,
+  "has_icon": false
+}

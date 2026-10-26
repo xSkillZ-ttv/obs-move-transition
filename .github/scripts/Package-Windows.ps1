@@ -14,94 +14,36 @@ if ( $DebugPreference -eq 'Continue' ) {
 }
 
 if ( $env:CI -eq $null ) {
-    throw "Package-Windows.ps1 requires CI environment"
+    throw 'Package-Windows.ps1 requires CI environment'
 }
 
 if ( ! ( [System.Environment]::Is64BitOperatingSystem ) ) {
-    throw "Packaging script requires a 64-bit system to build and run."
+    throw 'Packaging script requires a 64-bit system to build and run.'
 }
 
 if ( $PSVersionTable.PSVersion -lt '7.2.0' ) {
-    Write-Warning 'The packaging script requires PowerShell Core 7. Install or upgrade your PowerShell version: https://aka.ms/pscore6'
-    exit 2
+    throw 'The packaging script requires PowerShell 7.2 or newer.'
 }
 
-function Package {
-    trap {
-        Write-Error $_
-        exit 2
-    }
-
-    $ScriptHome = $PSScriptRoot
-    $ProjectRoot = Resolve-Path -Path "$PSScriptRoot/../.."
-    $BuildSpecFile = "${ProjectRoot}/buildspec.json"
-
-    $UtilityFunctions = Get-ChildItem -Path $PSScriptRoot/utils.pwsh/*.ps1 -Recurse
-
-    foreach( $Utility in $UtilityFunctions ) {
-        Write-Debug "Loading $($Utility.FullName)"
-        . $Utility.FullName
-    }
-
-    $BuildSpec = Get-Content -Path ${BuildSpecFile} -Raw | ConvertFrom-Json
-    $ProductName = $BuildSpec.name
-    $ProductVersion = $BuildSpec.version
-
-    $OutputName = "${ProductName}-${ProductVersion}-windows-${Target}"
-
-    $RemoveArgs = @{
-        ErrorAction = 'SilentlyContinue'
-        Path = @(
-            "${ProjectRoot}/release/${ProductName}-*-windows-*.zip"
-        )
-    }
-
-    Remove-Item @RemoveArgs
-
-    $RemoveArgs = @{
-        ErrorAction = 'SilentlyContinue'
-        Path = @(
-            "${ProjectRoot}/release/${ProductName}-*-windows-*.exe"
-        )
-    }
-
-    Remove-Item @RemoveArgs
-
-    $IsccFile = "${ProjectRoot}/build_${Target}/installer-Windows.generated.iss"
-
-    if ( ! ( Test-Path -Path $IsccFile ) ) {
-        throw 'InnoSetup install script not found. Run the build script or the CMake build and install procedures first.'
-    }
-
-    Copy-Item -Path "${ProjectRoot}/release/${Configuration}/${ProductName}/bin" -Destination "${ProjectRoot}/release/Package/obs-plugins" -Recurse
-    Copy-Item -Path "${ProjectRoot}/release/${Configuration}/${ProductName}/data" -Destination "${ProjectRoot}/release/Package/data/obs-plugins/${ProductName}" -Recurse
-    Copy-Item "${IsccFile}" -Destination "${ProjectRoot}/release"
-    Copy-Item "${ProjectRoot}/media/icon.ico" -Destination "${ProjectRoot}/release"
-
-    Log-Information 'Creating InnoSetup installer...'
-    Push-Location -Stack BuildTemp
-    Ensure-Location -Path "${ProjectRoot}/release"
-    Invoke-External iscc ${IsccFile} /O. /F"${OutputName}-Installer"
-    Pop-Location -Stack BuildTemp
-
-    Log-Group "Archiving ${ProductName}..."
-    $CompressArgs = @{
-        Path = (Get-ChildItem -Path "${ProjectRoot}/release/${Configuration}" -Exclude "${OutputName}*.*")
-        CompressionLevel = 'Optimal'
-        DestinationPath = "${ProjectRoot}/release/${OutputName}-programdata.zip"
-        Verbose = ($Env:CI -ne $null)
-    }
-    Compress-Archive -Force @CompressArgs
-
-    $CompressArgs = @{
-        Path = (Get-ChildItem -Path "${ProjectRoot}/release/Package" -Exclude "${OutputName}*.*")
-        CompressionLevel = 'Optimal'
-        DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
-        Verbose = ($Env:CI -ne $null)
-    }
-    Compress-Archive -Force @CompressArgs
-
-    Log-Group
+$ProjectRoot = (Resolve-Path -LiteralPath "$PSScriptRoot/../..").Path
+foreach ($Utility in (Get-ChildItem -Path "$PSScriptRoot/utils.pwsh/*.ps1")) {
+    . $Utility.FullName
 }
 
-Package
+$BuildSpec = Get-Content -LiteralPath "$ProjectRoot/buildspec.json" -Raw | ConvertFrom-Json
+$OutputName = "$($BuildSpec.name)-$($BuildSpec.version)-windows-$Target"
+$IsccFile = "$ProjectRoot/build_$Target/installer-Windows.generated.iss"
+if (!(Test-Path -LiteralPath $IsccFile -PathType Leaf)) {
+    throw 'Inno Setup script not found. Run CMake build and install first.'
+}
+
+Log-Information 'Creating OBS 33+ ProgramData and portable archives...'
+$Packages = New-WindowsPluginPackage -ProjectRoot $ProjectRoot -Target $Target -Configuration $Configuration
+
+Log-Information 'Creating Inno Setup installer...'
+Push-Location -LiteralPath "$ProjectRoot/release"
+try {
+    Invoke-External iscc $IsccFile /O. /F"$OutputName-Installer"
+} finally {
+    Pop-Location
+}

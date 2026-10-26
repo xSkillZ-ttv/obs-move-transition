@@ -1,0 +1,29 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test filter cleanup and socket failure paths
+        run: python3 tests/test_runtime_regressions.py --cc gcc
+
+  windows-package:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test archives and compile the installer using fixture files
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (!$iscc) { $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' }
+          if (!(Test-Path -LiteralPath $iscc)) { throw 'Inno Setup compiler missing' }
+          .github/tests/Test-WindowsPackage.ps1 -IsccPath $iscc

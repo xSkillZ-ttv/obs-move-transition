@@ -4,9 +4,6 @@
 #define MyAppURL "@PLUGIN_WEBSITE@"
 
 [Setup]
-; NOTE: The value of AppId uniquely identifies this application.
-; Do not use the same AppId value in installers for other applications.
-; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
 AppId={{@UUID_APP@}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -14,7 +11,10 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={code:GetDirName}
+DefaultDirName={commonappdata}\obs-studio\plugins\{#MyAppName}
+; Old installers stored the OBS application directory in the uninstall record.
+UsePreviousAppDir=no
+DisableDirPage=yes
 AppendDefaultDirName=no
 DefaultGroupName={#MyAppName}
 OutputBaseFilename={#MyAppName}-{#MyAppVersion}-windows-installer
@@ -22,7 +22,11 @@ Compression=lzma
 SolidCompression=yes
 DirExistsWarning=no
 AllowNoIcons=yes
-; Wizard Information
+PrivilegesRequired=admin
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+CloseApplications=yes
+RestartApplications=no
 WizardStyle=modern
 WizardResizable=yes
 SetupIconFile="../media/icon.ico"
@@ -31,15 +35,18 @@ SetupIconFile="../media/icon.ico"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "..\release\Package\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\release\Package\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\LICENSE"; Flags: dontcopy
-; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
 Name: "{group}\{cm:ProgramOnTheWeb,{#MyAppName}}"; Filename: "{#MyAppURL}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 [Code]
+var
+  ObsDirectory: String;
+  CleanupFailed: Boolean;
+
 procedure InitializeWizard();
 var
   GPLText: AnsiString;
@@ -49,57 +56,109 @@ begin
   LoadStringFromFile(ExpandConstant('{tmp}\LICENSE'), GPLText);
   Page := CreateOutputMsgMemoPage(wpWelcome,
     'License Information', 'Please review the license terms before installing {#MyAppName}',
-    'Press Page Down to see the rest of the agreement. Once you are aware of your rights, click Next to continue.',
+    'This package requires OBS Studio 33 or newer. For portable OBS, use the portable ZIP. ' +
+    'Press Page Down to see the rest of the agreement, then click Next to continue.',
     String(GPLText)
   );
 end;
 
-// credit where it's due :
-// following function come from https://github.com/Xaymar/obs-studio_amf-encoder-plugin/blob/master/%23Resources/Installer.in.iss#L45
-function GetDirName(Value: string): string;
+function GetObsDirectory(): String;
 var
-  InstallPath: string;
+  InstallPath: String;
 begin
-  // initialize default path, which will be returned when the following registry
-  // key queries fail due to missing keys or for some different reason
-  Result := ExpandConstant('{pf}\obs-studio');
-  // query the first registry value; if this succeeds, return the obtained value
-  if RegQueryStringValue(HKLM32, 'SOFTWARE\OBS Studio', '', InstallPath) then
-    Result := InstallPath;
-  if RegQueryStringValue(HKLM64, 'SOFTWARE\OBS Studio', '', InstallPath) then
-    Result := InstallPath;
+  { /OBSDIR supports a custom non-portable OBS installation. }
+  Result := ExpandConstant('{param:OBSDIR|}');
+  if Result <> '' then begin
+    Result := RemoveBackslashUnlessRoot(ExpandFileName(Result));
+    exit;
+  end;
+  if RegQueryStringValue(HKLM64, 'SOFTWARE\OBS Studio', '', InstallPath) then begin
+    if FileExists(AddBackslash(InstallPath) + 'bin\64bit\obs64.exe') then begin
+      Result := RemoveBackslashUnlessRoot(ExpandFileName(InstallPath));
+      exit;
+    end;
+  end;
+  if RegQueryStringValue(HKLM32, 'SOFTWARE\OBS Studio', '', InstallPath) then begin
+    if FileExists(AddBackslash(InstallPath) + 'bin\64bit\obs64.exe') then begin
+      Result := RemoveBackslashUnlessRoot(ExpandFileName(InstallPath));
+      exit;
+    end;
+  end;
+  Result := ExpandConstant('{commonpf64}\obs-studio');
 end;
 
-/////////////////////////////////////////////////////////////////////
-function NextButtonClick(PageId: Integer): Boolean;
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-    ObsFileName: string;
-    ObsMS, ObsLS: Cardinal;
-    ObsMajorVersion, ObsMinorVersion: Cardinal;
+  ObsFileName: String;
+  ObsMS, ObsLS: Cardinal;
 begin
-    Result := True;
-    if not (PageId = wpSelectDir) then begin
-        exit;
+  Result := '';
+  if CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')),
+      ExpandConstant('{commonappdata}\obs-studio\plugins\{#MyAppName}')) <> 0 then begin
+    Result := 'This installer uses the standard ProgramData plugin location. Use the portable ZIP for portable OBS.';
+    exit;
+  end;
+
+  ObsDirectory := GetObsDirectory();
+  ObsFileName := AddBackslash(ObsDirectory) + 'bin\64bit\obs64.exe';
+  if not FileExists(ObsFileName) then begin
+    Result := 'OBS Studio was not found. Install OBS Studio 33 or newer first, or pass /OBSDIR="path to OBS" for a custom installation.';
+    exit;
+  end;
+  if FileExists(AddBackslash(ObsDirectory) + 'portable_mode.txt') or
+      FileExists(AddBackslash(ObsDirectory) + 'portable_mode') then begin
+    Result := 'This OBS installation uses portable mode. Extract the portable ZIP into its root directory instead.';
+    exit;
+  end;
+  if not GetVersionNumbers(ObsFileName, ObsMS, ObsLS) then begin
+    Result := 'Failed to read the OBS Studio version from ' + ObsFileName;
+    exit;
+  end;
+  if (ObsMS shr 16) < 33 then
+    Result := 'OBS Studio 33 or newer is required by this plugin package.';
+end;
+
+procedure RegisterLegacyModule(FileName: String);
+begin
+#if VER < EncodeVer(7, 0, 0)
+  RegisterExtraCloseApplicationsResource(True, FileName);
+#else
+  RegisterExtraCloseApplicationsResource(FileName);
+#endif
+end;
+
+procedure RegisterExtraCloseApplicationsResources();
+begin
+  RegisterLegacyModule(AddBackslash(GetObsDirectory()) + 'obs-plugins\64bit\{#MyAppName}.dll');
+  RegisterLegacyModule(ExpandConstant('{app}\bin\64bit\{#MyAppName}.dll'));
+end;
+
+procedure RemoveLegacyFile(FileName: String);
+begin
+  if FileExists(FileName) then begin
+    if not DeleteFile(FileName) then begin
+      CleanupFailed := True;
+      Log('Could not remove legacy plugin file: ' + FileName);
     end;
-    ObsFileName := ExpandConstant('{app}\bin\64bit\obs64.exe');
-    if not FileExists(ObsFileName) then begin
-        MsgBox('OBS Studio (bin\64bit\obs64.exe) does not seem to be installed in that folder.  Please select the correct folder.', mbError, MB_OK);
-        Result := False;
-        exit;
-    end;
-    Result := GetVersionNumbers(ObsFileName, ObsMS, ObsLS);
-    if not Result then begin
-        MsgBox('Failed to read version from OBS Studio (bin\64bit\obs64.exe).', mbError, MB_OK);
-        Result := False;
-        exit;
-    end;
-    { shift 16 bits to the right to get major version }
-    ObsMajorVersion := ObsMS shr 16; 
-    { select only low 16 bits }
-    ObsMinorVersion := ObsMS and $FFFF;
-    if ObsMajorVersion < 31 then begin
-        MsgBox('Version of OBS Studio (bin\64bit\obs64.exe) is lower than the version 31 required.', mbError, MB_OK);
-        Result := False;
-        exit;
-    end;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+
+  { Only this plugin's old binaries are removed, after the new files are installed.
+    Shared OBS directories, core modules and user settings are never removed.
+    Old data/obs-plugins resources are left intact; they cannot load a plugin. }
+  RemoveLegacyFile(AddBackslash(ObsDirectory) + 'obs-plugins\64bit\{#MyAppName}.dll');
+  RemoveLegacyFile(AddBackslash(ObsDirectory) + 'obs-plugins\64bit\{#MyAppName}.pdb');
+  RemoveLegacyFile(ExpandConstant('{app}\bin\64bit\{#MyAppName}.dll'));
+  RemoveLegacyFile(ExpandConstant('{app}\bin\64bit\{#MyAppName}.pdb'));
+  RemoveDir(ExpandConstant('{app}\bin\64bit'));
+  RemoveDir(ExpandConstant('{app}\bin'));
+
+  if CleanupFailed then
+    SuppressibleMsgBox('The new plugin was installed, but an old plugin file could not be removed. ' +
+      'Close OBS and run this installer again to finish removing the legacy copy.', mbInformation, MB_OK, IDOK);
 end;

@@ -1,0 +1,255 @@
+/* Production function bodies are inserted by test_runtime_regressions.py. */
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define DARRAY(type) struct { type *array; size_t num; }
+#define da_init(a) do { (a).array = NULL; (a).num = 0; } while (0)
+#define da_free(a) do { free((a).array); da_init(a); } while (0)
+#define da_push_back_new(a) test_array_append((void **)&(a).array, &(a).num, sizeof(*(a).array), NULL)
+#define da_push_back(a, v) test_array_append((void **)&(a).array, &(a).num, sizeof(*(a).array), (v))
+#define da_erase(a, i) test_array_erase((a).array, &(a).num, sizeof(*(a).array), (i))
+#define da_erase_item(a, v) test_array_erase_item((a).array, &(a).num, sizeof(*(a).array), (v))
+
+static void *test_array_append(void **array, size_t *count, size_t size, const void *value)
+{
+	*array = realloc(*array, (*count + 1) * size);
+	assert(*array);
+	void *entry = (char *)*array + (*count)++ * size;
+	if (value) memcpy(entry, value, size);
+	else memset(entry, 0, size);
+	return entry;
+}
+
+static void test_array_erase(void *array, size_t *count, size_t size, size_t index)
+{
+	assert(index < *count);
+	memmove((char *)array + index * size, (char *)array + (index + 1) * size, (*count - index - 1) * size);
+	--*count;
+}
+
+static void test_array_erase_item(void *array, size_t *count, size_t size, const void *value)
+{
+	for (size_t index = 0; index < *count; index++) {
+		if (memcmp((char *)array + index * size, value, size) == 0) {
+			test_array_erase(array, count, size, index);
+			return;
+		}
+	}
+}
+
+typedef int pthread_t;
+typedef int pthread_mutex_t;
+typedef uint64_t obs_hotkey_id;
+typedef struct { int unused; } obs_source_t;
+typedef struct { int start_trigger; int stop_trigger; } obs_data_t;
+#define OBS_INVALID_HOTKEY_ID UINT64_MAX
+@DEFINES@
+@MOVE_FILTER@
+@UDP_SERVER@
+DARRAY(struct udp_server) udp_servers;
+pthread_mutex_t udp_servers_mutex;
+static int stop_requests[16];
+static int lock_depth;
+static int socket_closes;
+static int hotkeys_unregistered;
+
+static void pthread_mutex_lock(pthread_mutex_t *mutex) { (void)mutex; assert(lock_depth++ == 0); }
+static void pthread_mutex_unlock(pthread_mutex_t *mutex) { (void)mutex; assert(--lock_depth == 0); }
+static pthread_t pthread_self(void) { return 1; }
+static bool pthread_equal(pthread_t a, pthread_t b) { return a == b; }
+static int pthread_create(pthread_t *thread, const void *attributes, void *(*function)(void *), void *data)
+{
+	(void)thread; (void)attributes; (void)function; (void)data;
+	assert(!"Unexpected thread creation in disabled-trigger tests");
+	return -1;
+}
+
+static void stop_udp_thread(struct udp_server *server)
+{
+	assert(lock_depth == 1);
+	assert(server->port >= 0 && server->port < 16);
+	stop_requests[server->port]++;
+}
+
+static void bfree(void *value) { free(value); }
+static char *bstrdup(const char *value)
+{
+	char *result = malloc(strlen(value) + 1);
+	assert(result);
+	strcpy(result, value);
+	return result;
+}
+static void obs_hotkey_unregister(obs_hotkey_id id) { (void)id; hotkeys_unregistered++; }
+static const char *obs_source_get_name(obs_source_t *source) { (void)source; return "filter"; }
+static obs_source_t *obs_filter_get_parent(obs_source_t *source) { (void)source; return NULL; }
+static bool obs_source_enabled(obs_source_t *source) { (void)source; return false; }
+static bool obs_data_get_bool(obs_data_t *settings, const char *name) { (void)settings; (void)name; return false; }
+static long long obs_data_get_int(obs_data_t *settings, const char *name)
+{
+	if (strcmp(name, S_START_TRIGGER) == 0) return settings->start_trigger;
+	if (strcmp(name, S_STOP_TRIGGER) == 0) return settings->stop_trigger;
+	return 0;
+}
+static const char *obs_data_get_string(obs_data_t *settings, const char *name) { (void)settings; (void)name; return ""; }
+static const char *obs_module_text(const char *value) { return value; }
+static void move_filter_start(struct move_filter *filter) { (void)filter; assert(!"Unexpected trigger"); }
+static void move_filter_stop(struct move_filter *filter) { (void)filter; assert(!"Unexpected trigger"); }
+static obs_data_t *obs_source_get_settings(obs_source_t *source) { (void)source; return NULL; }
+static void obs_data_release(obs_data_t *settings) { (void)settings; }
+#define obs_hotkey_register_source(...) 0
+struct dstr { char *array; };
+static void dstr_init_copy(struct dstr *s, const char *text) { s->array = bstrdup(text); }
+static void dstr_cat(struct dstr *s, const char *text) { (void)s; (void)text; }
+static void dstr_free(struct dstr *s) { free(s->array); }
+
+/* A socket is created successfully, but its port is already in use. */
+#define SOCKET int
+#define AF_INET 2
+#define SOCK_DGRAM 2
+#define IPPROTO_UDP 17
+#define INADDR_ANY 0
+#define LOG_ERROR 1
+typedef unsigned int socklen_t;
+struct sockaddr { int unused; };
+struct sockaddr_in { int sin_family; int sin_port; struct { unsigned int s_addr; } sin_addr; };
+static int socket(int family, int type, int protocol) { (void)family; (void)type; (void)protocol; return 42; }
+static int bind(int descriptor, const struct sockaddr *address, size_t size) { (void)address; (void)size; assert(descriptor == 42); return -1; }
+static void closesocket(int descriptor) { assert(descriptor == 42); socket_closes++; }
+static int recvfrom(int descriptor, void *buf, size_t size, int flags, struct sockaddr *address, socklen_t *length)
+{
+	(void)descriptor; (void)buf; (void)size; (void)flags; (void)address; (void)length;
+	assert(!"recvfrom must not run after bind failure"); return -1;
+}
+static int htons(int port) { return port; }
+static unsigned int htonl(unsigned int address) { return address; }
+static void os_set_thread_name(const char *name) { (void)name; }
+#define blog(...) ((void)0)
+@UDP_THREAD@
+@DESTROY@
+@UPDATE@
+
+static struct move_filter new_filter(void)
+{
+	struct move_filter filter = {0};
+	filter.move_start_hotkey = OBS_INVALID_HOTKEY_ID;
+	filter.move_hold_hotkey = OBS_INVALID_HOTKEY_ID;
+	return filter;
+}
+
+static void new_servers(size_t count)
+{
+	/* The guard makes the old wrong-index code skip a registration
+	 * deterministically, instead of depending on an out-of-bounds crash. */
+	udp_servers.array = calloc(count + 1, sizeof(*udp_servers.array));
+	assert(udp_servers.array);
+	udp_servers.num = count;
+	memset(stop_requests, 0, sizeof(stop_requests));
+	for (size_t i = 0; i < count; i++) udp_servers.array[i].port = (int)i;
+}
+
+static void free_servers(void)
+{
+	for (size_t i = 0; i < udp_servers.num; i++) {
+		da_free(udp_servers.array[i].start_triggers);
+		da_free(udp_servers.array[i].stop_triggers);
+	}
+	da_free(udp_servers);
+	assert(lock_depth == 0);
+}
+
+static void remove_filter(struct move_filter *filter, bool destroy)
+{
+	if (destroy) move_filter_destroy(filter);
+	else { obs_data_t settings = {0}; move_filter_update(filter, &settings); }
+}
+
+static void test_multiple_triggers_on_one_server(bool destroy, bool stop_trigger)
+{
+	struct move_filter other = new_filter(), target = new_filter();
+	struct move_filter *a = &other, *b = &target;
+	new_servers(1);
+	if (stop_trigger) {
+		da_push_back(udp_servers.array[0].stop_triggers, &a);
+		da_push_back(udp_servers.array[0].stop_triggers, &b);
+	} else {
+		da_push_back(udp_servers.array[0].start_triggers, &a);
+		da_push_back(udp_servers.array[0].start_triggers, &b);
+	}
+	remove_filter(&target, destroy);
+	assert(udp_servers.array[0].start_triggers.num == (stop_trigger ? 0 : 1));
+	assert(udp_servers.array[0].stop_triggers.num == (stop_trigger ? 1 : 0));
+	assert(stop_requests[0] == 0);
+	free_servers();
+	if (!destroy) move_filter_destroy(&target);
+}
+
+static void test_second_server_after_empty_first(bool destroy)
+{
+	struct move_filter target = new_filter(); struct move_filter *p = &target;
+	new_servers(2);
+	da_push_back(udp_servers.array[1].start_triggers, &p);
+	da_push_back(udp_servers.array[1].stop_triggers, &p);
+	remove_filter(&target, destroy);
+	assert(udp_servers.array[1].start_triggers.num == 0);
+	assert(udp_servers.array[1].stop_triggers.num == 0);
+	assert(stop_requests[0] == 0 && stop_requests[1] == 1);
+	free_servers();
+	if (!destroy) move_filter_destroy(&target);
+}
+
+static void test_stop_uses_current_server(bool destroy)
+{
+	struct move_filter other = new_filter(), target = new_filter();
+	struct move_filter *a = &other, *b = &target;
+	new_servers(2);
+	da_push_back(udp_servers.array[0].start_triggers, &a);
+	da_push_back(udp_servers.array[1].start_triggers, &b);
+	da_push_back(udp_servers.array[1].stop_triggers, &a);
+	remove_filter(&target, destroy);
+	assert(udp_servers.array[1].start_triggers.num == 0);
+	assert(udp_servers.array[1].stop_triggers.num == 1);
+	assert(stop_requests[0] == 0 && stop_requests[1] == 0);
+	free_servers();
+	if (!destroy) move_filter_destroy(&target);
+}
+
+static void test_hotkey_history_is_freed(void)
+{
+	struct move_filter target = new_filter(); obs_source_t *source = NULL;
+	da_push_back(target.filters_done, &source);
+	target.move_start_hotkey = 1; target.move_hold_hotkey = 2;
+	move_filter_destroy(&target);
+	assert(target.filters_done.array == NULL && target.filters_done.num == 0);
+	assert(hotkeys_unregistered == 2);
+}
+
+int main(int argc, char **argv)
+{
+	const char *test = argc > 1 ? argv[1] : "all";
+	int scenarios = 0;
+	if (strcmp(test, "all") == 0 || strcmp(test, "udp") == 0) {
+		for (int destroy = 0; destroy <= 1; destroy++) {
+			test_multiple_triggers_on_one_server(destroy, false);
+			test_multiple_triggers_on_one_server(destroy, true);
+			test_second_server_after_empty_first(destroy);
+			test_stop_uses_current_server(destroy);
+			scenarios += 4;
+		}
+	}
+	if (strcmp(test, "all") == 0 || strcmp(test, "history") == 0) {
+		test_hotkey_history_is_freed(); scenarios++;
+	}
+	if (strcmp(test, "all") == 0 || strcmp(test, "bind") == 0) {
+		struct udp_server server = {0};
+		assert(udp_server_thread(&server) == NULL);
+		assert(socket_closes == 1); scenarios++;
+	}
+	assert(scenarios > 0);
+	printf("PASS: %d runtime regression scenarios (%s)\n", scenarios, test);
+	return 0;
+}

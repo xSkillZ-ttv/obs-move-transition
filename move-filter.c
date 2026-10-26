@@ -67,20 +67,20 @@ void move_filter_destroy(struct move_filter *move_filter)
 {
 	pthread_mutex_lock(&udp_servers_mutex);
 	for (size_t i = 0; i < udp_servers.num; i++) {
-		for (size_t j = 0; j < udp_servers.array[j].start_triggers.num; j++) {
+		for (size_t j = 0; j < udp_servers.array[i].start_triggers.num; j++) {
 			if (udp_servers.array[i].start_triggers.array[j] != move_filter)
 				continue;
 			da_erase(udp_servers.array[i].start_triggers, j);
-			if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[j].stop_triggers.num) {
+			if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[i].stop_triggers.num) {
 				stop_udp_thread(&udp_servers.array[i]);
 			}
 			break;
 		}
-		for (size_t j = 0; j < udp_servers.array[j].stop_triggers.num; j++) {
+		for (size_t j = 0; j < udp_servers.array[i].stop_triggers.num; j++) {
 			if (udp_servers.array[i].stop_triggers.array[j] != move_filter)
 				continue;
 			da_erase(udp_servers.array[i].stop_triggers, j);
-			if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[j].stop_triggers.num) {
+			if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[i].stop_triggers.num) {
 				stop_udp_thread(&udp_servers.array[i]);
 			}
 			break;
@@ -91,6 +91,7 @@ void move_filter_destroy(struct move_filter *move_filter)
 	bfree(move_filter->filter_name);
 	bfree(move_filter->simultaneous_move_name);
 	bfree(move_filter->next_move_name);
+	da_free(move_filter->filters_done);
 
 	if (move_filter->move_start_hotkey != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(move_filter->move_start_hotkey);
@@ -222,6 +223,7 @@ static void *udp_server_thread(void *data)
 
 	if (bind(sockfd, (struct sockaddr *)&si_me, sizeof(si_me)) == -1) {
 		blog(LOG_ERROR, "[Move Transition] Error listening on udp port %i", udp_server->port);
+		closesocket(sockfd);
 		return NULL;
 	}
 	struct sockaddr_in si_other;
@@ -377,11 +379,11 @@ void move_filter_update(struct move_filter *move_filter, obs_data_t *settings)
 	} else {
 		// stop existing udp server
 		for (size_t i = 0; i < udp_servers.num; i++) {
-			for (size_t j = 0; j < udp_servers.array[j].start_triggers.num; j++) {
+			for (size_t j = 0; j < udp_servers.array[i].start_triggers.num; j++) {
 				if (udp_servers.array[i].start_triggers.array[j] != move_filter)
 					continue;
 				da_erase(udp_servers.array[i].start_triggers, j);
-				if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[j].stop_triggers.num) {
+				if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[i].stop_triggers.num) {
 					stop_udp_thread(&udp_servers.array[i]);
 				}
 				break;
@@ -430,11 +432,11 @@ void move_filter_update(struct move_filter *move_filter, obs_data_t *settings)
 	} else {
 		// stop existing udp server
 		for (size_t i = 0; i < udp_servers.num; i++) {
-			for (size_t j = 0; j < udp_servers.array[j].stop_triggers.num; j++) {
+			for (size_t j = 0; j < udp_servers.array[i].stop_triggers.num; j++) {
 				if (udp_servers.array[i].stop_triggers.array[j] != move_filter)
 					continue;
 				da_erase(udp_servers.array[i].stop_triggers, j);
-				if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[j].stop_triggers.num) {
+				if (!udp_servers.array[i].start_triggers.num && !udp_servers.array[i].stop_triggers.num) {
 					stop_udp_thread(&udp_servers.array[i]);
 				}
 				break;

@@ -30,7 +30,7 @@ ${PROJECT_NAME} PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-
                                 -Wno-comma>)
 set_target_properties(${PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_DIR}/version.h)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/version.h)
 
 if(OS_WINDOWS)
 	target_sources(${PROJECT_NAME} PRIVATE 
@@ -54,10 +54,14 @@ target_sources(${PROJECT_NAME} PRIVATE
 	easing.c
 	move-transition.h
 	easing.h
-	version.h)
+	${CMAKE_CURRENT_BINARY_DIR}/version.h)
 
 if(BUILD_OUT_OF_TREE)
 	set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+	if(OS_WINDOWS)
+		configure_file(cmake/windows/resources/manifest.json.in "${CMAKE_CURRENT_BINARY_DIR}/manifest.json" @ONLY)
+		target_add_resource(${PROJECT_NAME} "${CMAKE_CURRENT_BINARY_DIR}/manifest.json")
+	endif()
 else()
 	set_target_properties_obs(${PROJECT_NAME} PROPERTIES FOLDER "plugins/exeldro" PREFIX "")
 endif()
