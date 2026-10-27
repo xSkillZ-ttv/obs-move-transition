@@ -290,6 +290,23 @@ jobs:
           config: ${{ needs.check-event.outputs.config }}
           package: ${{ fromJSON(needs.check-event.outputs.package) }}
 
+      - name: Verify loading and UDP cleanup with OBS 33
+        timeout-minutes: 5
+        env:
+          BUILD_CONFIG: ${{ needs.check-event.outputs.config }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'OBS-Studio-33.0.0-Windows-x64.zip'
+          $runtime = Join-Path $env:RUNNER_TEMP 'obs33-runtime'
+          Invoke-WebRequest -Uri 'https://github.com/obsproject/obs-studio/releases/download/33.0.0/OBS-Studio-33.0.0-Windows-x64.zip' -OutFile $archive
+          $expected = '3369a3ecd67b5669a8a08d77357f87cc786d1fba42fbbd1054d841a69f6271a7'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'OBS runtime archive checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $runtime
+          python tests/smoke_obs33_windows.py --obs-root $runtime --plugins-root "release/$env:BUILD_CONFIG" --config-root "$env:RUNNER_TEMP/move-smoke-config" --udp-stress
+          if ($LASTEXITCODE -ne 0) { throw "OBS 33 integration test failed: $LASTEXITCODE" }
+
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v4
         with:

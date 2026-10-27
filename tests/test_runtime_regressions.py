@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--cc", help="C11 compiler executable")
     parser.add_argument("--cc-arg", action="append", default=[], help="Compiler driver argument, e.g. cc for Zig")
     parser.add_argument("--source-dir", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--case", choices=["all", "udp", "history", "bind"], default="all")
+    parser.add_argument("--case", choices=["all", "udp", "history", "bind", "lifecycle"], default="all")
     args = parser.parse_args()
     compiler = args.cc or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if not compiler:
@@ -48,7 +48,8 @@ def main():
         "DEFINES": "\n".join(re.findall(r"^#define (?:S_[A-Z_]+|START_TRIGGER_UDP) .+$", header, re.MULTILINE)),
         "MOVE_FILTER": extract_block(header, "struct move_filter {", True),
         "UDP_SERVER": extract_block(source, "struct udp_server {", True),
-        "UDP_THREAD": extract_block(source, "static void *udp_server_thread(void *data)"),
+        "UDP_TRIGGER": extract_block(source, "struct udp_trigger {", True),
+        "UDP_CODE": source[source.index("static bool udp_socket_retry(void)") : source.index("void move_filter_update(")],
         "DESTROY": extract_block(source, "void move_filter_destroy(struct move_filter *move_filter)"),
         "UPDATE": extract_block(source, "void move_filter_update(struct move_filter *move_filter, obs_data_t *settings)"),
     }

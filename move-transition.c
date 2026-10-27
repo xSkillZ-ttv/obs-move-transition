@@ -3324,9 +3324,6 @@ extern void unload_nvar(void);
 void SetMoveDirectShowFilter(struct obs_source_info *obs_source_info);
 #endif
 
-extern DARRAY(struct udp_server) udp_servers;
-extern pthread_mutex_t udp_servers_mutex;
-
 static float move_get_transition_filter(obs_source_t *filter_from, obs_source_t **filter_to)
 {
 	if (!filter_from)
@@ -3438,16 +3435,17 @@ void move_frontend_event(enum obs_frontend_event event, void *data)
 	UNUSED_PARAMETER(data);
 	if (event == OBS_FRONTEND_EVENT_EXIT) {
 		move_exit = true;
+		move_filter_udp_shutdown();
 	}
 }
 
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Move Transition] loaded version %s", PROJECT_VERSION);
-	da_init(udp_servers);
+	if (!move_filter_udp_init())
+		return false;
 	da_init(move_rendering);
 	da_init(move_render_filter_ids);
-	pthread_mutex_init(&udp_servers_mutex, NULL);
 	obs_register_source(&move_transition);
 	obs_register_source(&move_transition_override_filter);
 	obs_register_source(&move_source_filter);
@@ -3482,11 +3480,10 @@ void obs_module_post_load()
 void obs_module_unload()
 {
 	obs_frontend_remove_event_callback(move_frontend_event, NULL);
-	da_free(udp_servers);
+	move_filter_udp_free();
 	da_free(move_rendering);
 	for (size_t i = 0; i < move_render_filter_ids.num; i++) {
 		bfree(move_render_filter_ids.array[i]);
 	}
 	da_free(move_render_filter_ids);
-	//pthread_mutex_destroy(&udp_servers_mutex);
 }

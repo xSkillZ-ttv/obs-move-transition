@@ -1,4 +1,6 @@
-/* Production function bodies are inserted by test_runtime_regressions.py. */
+/* Production lifecycle functions are inserted by test_runtime_regressions.py.
+ * Deterministic OS doubles exercise failures and callback reentrancy. Real OBS
+ * integration tests separately exercise actual threads, sockets and teardown. */
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -8,248 +10,260 @@
 #include <string.h>
 
 #define DARRAY(type) struct { type *array; size_t num; }
+#define DARRAY_INVALID SIZE_MAX
 #define da_init(a) do { (a).array = NULL; (a).num = 0; } while (0)
 #define da_free(a) do { free((a).array); da_init(a); } while (0)
-#define da_push_back_new(a) test_array_append((void **)&(a).array, &(a).num, sizeof(*(a).array), NULL)
-#define da_push_back(a, v) test_array_append((void **)&(a).array, &(a).num, sizeof(*(a).array), (v))
-#define da_erase(a, i) test_array_erase((a).array, &(a).num, sizeof(*(a).array), (i))
-#define da_erase_item(a, v) test_array_erase_item((a).array, &(a).num, sizeof(*(a).array), (v))
-
-static void *test_array_append(void **array, size_t *count, size_t size, const void *value)
+#define da_move(a,b) do { (a).array=(b).array; (a).num=(b).num; da_init(b); } while(0)
+#define da_push_back(a,v) test_append((void **)&(a).array, &(a).num, sizeof(*(a).array), (v))
+#define da_erase(a,i) test_erase((a).array, &(a).num, sizeof(*(a).array), (i))
+#define da_find(a,v,i) test_find((a).array, (a).num, sizeof(*(a).array), (v), (i))
+#define da_erase_item(a,v) do { size_t at=da_find(a,v,0); if(at!=DARRAY_INVALID) da_erase(a,at); } while(0)
+static void test_append(void **array,size_t *num,size_t size,const void *value)
 {
-	*array = realloc(*array, (*count + 1) * size);
-	assert(*array);
-	void *entry = (char *)*array + (*count)++ * size;
-	if (value) memcpy(entry, value, size);
-	else memset(entry, 0, size);
-	return entry;
+    /* Always relocate: dangling pointers into the registry cannot pass by luck. */
+    void *next=malloc((*num+1)*size); assert(next);
+    if(*num) memcpy(next,*array,*num*size);
+    free(*array); *array=next; memcpy((char *)next+(*num)++*size,value,size);
 }
-
-static void test_array_erase(void *array, size_t *count, size_t size, size_t index)
-{
-	assert(index < *count);
-	memmove((char *)array + index * size, (char *)array + (index + 1) * size, (*count - index - 1) * size);
-	--*count;
-}
-
-static void test_array_erase_item(void *array, size_t *count, size_t size, const void *value)
-{
-	for (size_t index = 0; index < *count; index++) {
-		if (memcmp((char *)array + index * size, value, size) == 0) {
-			test_array_erase(array, count, size, index);
-			return;
-		}
-	}
-}
+static void test_erase(void *array,size_t *num,size_t size,size_t i)
+{ assert(i<*num); memmove((char *)array+i*size,(char *)array+(i+1)*size,(*num-i-1)*size); --*num; }
+static size_t test_find(void *array,size_t num,size_t size,const void *v,size_t start)
+{ for(size_t i=start;i<num;i++) if(!memcmp((char *)array+i*size,v,size)) return i; return DARRAY_INVALID; }
 
 typedef int pthread_t;
 typedef int pthread_mutex_t;
 typedef uint64_t obs_hotkey_id;
-typedef struct { int unused; } obs_source_t;
-typedef struct { int start_trigger; int stop_trigger; } obs_data_t;
+struct move_filter;
+typedef struct { int start_trigger,stop_trigger,start_port,stop_port; const char *packet; } obs_data_t;
+typedef struct { int references; bool removed; struct move_filter *filter; obs_data_t settings; } obs_source_t;
 #define OBS_INVALID_HOTKEY_ID UINT64_MAX
+/* Exercise Windows' unsigned socket sentinel even on a POSIX CI compiler. */
+#ifndef _WIN32
+#define _WIN32 1
+#endif
+typedef uintptr_t SOCKET;
+#define INVALID_SOCKET UINTPTR_MAX
 @DEFINES@
 @MOVE_FILTER@
 @UDP_SERVER@
-DARRAY(struct udp_server) udp_servers;
-pthread_mutex_t udp_servers_mutex;
-static int stop_requests[16];
-static int lock_depth;
-static int socket_closes;
-static int hotkeys_unregistered;
+@UDP_TRIGGER@
+static DARRAY(struct udp_server *) udp_servers;
+static pthread_mutex_t udp_servers_mutex;
+static bool udp_shutdown;
+static int lock_depth,join_count,close_count,open_count,starts,stops,hotkeys_unregistered,waits;
+static bool socket_fails,bind_fails,nonblock_fails,thread_fails,reenter_update;
+static int ready_packets,receive_error,last_error;
+static const char *wire_packet="go";
+static struct { void *(*run)(void *); void *arg; bool joined; } threads[512];
+static int thread_count;
+static bool closed[1024];
+static int next_socket;
 
-static void pthread_mutex_lock(pthread_mutex_t *mutex) { (void)mutex; assert(lock_depth++ == 0); }
-static void pthread_mutex_unlock(pthread_mutex_t *mutex) { (void)mutex; assert(--lock_depth == 0); }
-static pthread_t pthread_self(void) { return 1; }
-static bool pthread_equal(pthread_t a, pthread_t b) { return a == b; }
-static int pthread_create(pthread_t *thread, const void *attributes, void *(*function)(void *), void *data)
+static int pthread_mutex_init(pthread_mutex_t *m,const void *attr) { (void)attr; *m=1; return 0; }
+static void pthread_mutex_lock(pthread_mutex_t *m) { assert(*m==1); assert(lock_depth++==0); }
+static void pthread_mutex_unlock(pthread_mutex_t *m) { assert(*m==1); assert(--lock_depth==0); }
+static int pthread_mutex_destroy(pthread_mutex_t *m) { assert(lock_depth==0); assert(waits>0); *m=0; return 0; }
+static int pthread_create(pthread_t *id,const void *attr,void *(*run)(void *),void *arg)
 {
-	(void)thread; (void)attributes; (void)function; (void)data;
-	assert(!"Unexpected thread creation in disabled-trigger tests");
-	return -1;
+    (void)attr; assert(lock_depth==1);
+    if(thread_fails) return 1;
+    assert(thread_count+1<512); *id=++thread_count;
+    threads[*id].run=run; threads[*id].arg=arg; threads[*id].joined=false; return 0;
 }
-
-static void stop_udp_thread(struct udp_server *server)
+static int pthread_join(pthread_t id,void **result)
 {
-	assert(lock_depth == 1);
-	assert(server->port >= 0 && server->port < 16);
-	stop_requests[server->port]++;
+    (void)result; assert(lock_depth==0); assert(!threads[id].joined);
+    struct udp_server *server=threads[id].arg;
+    if(!server->finished) threads[id].run(server);
+    assert(server->finished); threads[id].joined=true; join_count++; return 0;
 }
-
-static void bfree(void *value) { free(value); }
-static char *bstrdup(const char *value)
-{
-	char *result = malloc(strlen(value) + 1);
-	assert(result);
-	strcpy(result, value);
-	return result;
-}
+static void *bzalloc(size_t n) { void *p=calloc(1,n); assert(p); return p; }
+static void bfree(void *p) { free(p); }
+static char *bstrdup(const char *s) { char *p=malloc(strlen(s)+1); assert(p); strcpy(p,s); return p; }
 static void obs_hotkey_unregister(obs_hotkey_id id) { (void)id; hotkeys_unregistered++; }
-static const char *obs_source_get_name(obs_source_t *source) { (void)source; return "filter"; }
-static obs_source_t *obs_filter_get_parent(obs_source_t *source) { (void)source; return NULL; }
-static bool obs_source_enabled(obs_source_t *source) { (void)source; return false; }
-static bool obs_data_get_bool(obs_data_t *settings, const char *name) { (void)settings; (void)name; return false; }
-static long long obs_data_get_int(obs_data_t *settings, const char *name)
+static const char *obs_source_get_name(obs_source_t *s) { (void)s; return "filter"; }
+static obs_source_t *obs_filter_get_parent(obs_source_t *s) { (void)s; return NULL; }
+static bool obs_source_enabled(obs_source_t *s) { (void)s; return false; }
+static bool obs_data_get_bool(obs_data_t *d,const char *key) { (void)d; (void)key; return false; }
+static long long obs_data_get_int(obs_data_t *d,const char *key)
 {
-	if (strcmp(name, S_START_TRIGGER) == 0) return settings->start_trigger;
-	if (strcmp(name, S_STOP_TRIGGER) == 0) return settings->stop_trigger;
-	return 0;
+    if(!strcmp(key,S_START_TRIGGER)) return d->start_trigger;
+    if(!strcmp(key,S_STOP_TRIGGER)) return d->stop_trigger;
+    if(!strcmp(key,S_START_TRIGGER_UDP_PORT)) return d->start_port;
+    if(!strcmp(key,S_STOP_TRIGGER_UDP_PORT)) return d->stop_port;
+    return 0;
 }
-static const char *obs_data_get_string(obs_data_t *settings, const char *name) { (void)settings; (void)name; return ""; }
-static const char *obs_module_text(const char *value) { return value; }
-static void move_filter_start(struct move_filter *filter) { (void)filter; assert(!"Unexpected trigger"); }
-static void move_filter_stop(struct move_filter *filter) { (void)filter; assert(!"Unexpected trigger"); }
-static obs_data_t *obs_source_get_settings(obs_source_t *source) { (void)source; return NULL; }
-static void obs_data_release(obs_data_t *settings) { (void)settings; }
+static const char *obs_data_get_string(obs_data_t *d,const char *key)
+{
+    if(!strcmp(key,S_START_TRIGGER_UDP_PACKET)||!strcmp(key,S_STOP_TRIGGER_UDP_PACKET)) return d->packet?d->packet:"";
+    return "";
+}
+static const char *obs_module_text(const char *s) { return s; }
+static obs_source_t *obs_source_get_ref(obs_source_t *s)
+{ assert(lock_depth==1); if(!s||!s->references) return NULL; s->references++; return s; }
+static void obs_source_release(obs_source_t *s) { assert(lock_depth==0); assert(s->references>1); s->references--; }
+static bool obs_source_removed(obs_source_t *s) { return s->removed; }
+static obs_data_t *obs_source_get_settings(obs_source_t *s) { assert(lock_depth==0); return &s->settings; }
+static void *obs_obj_get_data(obs_source_t *s) { return s->filter; }
+static void obs_data_release(obs_data_t *d) { (void)d; assert(lock_depth==0); }
+static bool obs_wait_for_destroy_queue(void) { assert(lock_depth==0); assert(join_count==thread_count); waits++; return true; }
+void move_filter_update(struct move_filter *filter,obs_data_t *settings);
+static void move_filter_start(struct move_filter *filter)
+{
+    assert(lock_depth==0); starts++;
+    if(reenter_update) { obs_data_t settings={0}; move_filter_update(filter,&settings); }
+}
+static void move_filter_stop(struct move_filter *filter) { (void)filter; assert(lock_depth==0); stops++; }
 #define obs_hotkey_register_source(...) 0
 struct dstr { char *array; };
-static void dstr_init_copy(struct dstr *s, const char *text) { s->array = bstrdup(text); }
-static void dstr_cat(struct dstr *s, const char *text) { (void)s; (void)text; }
+static void dstr_init_copy(struct dstr *s,const char *text) { s->array=bstrdup(text); }
+static void dstr_cat(struct dstr *s,const char *text) { (void)s; (void)text; }
 static void dstr_free(struct dstr *s) { free(s->array); }
 
-/* A socket is created successfully, but its port is already in use. */
-#define SOCKET int
 #define AF_INET 2
 #define SOCK_DGRAM 2
 #define IPPROTO_UDP 17
 #define INADDR_ANY 0
 #define LOG_ERROR 1
-typedef unsigned int socklen_t;
+#define FIONBIO 1
+#define WSAEINTR 10004
+#define WSAEWOULDBLOCK 10035
+#define WSAEMSGSIZE 10040
+#define MAKEWORD(a,b) ((a)|((b)<<8))
+typedef unsigned long u_long;
+typedef int WSADATA;
+static int WSAStartup(int version,WSADATA *data) { (void)version;(void)data;return 0; }
+static void WSACleanup(void) { assert(lock_depth==0); }
+static int WSAGetLastError(void) { return last_error; }
 struct sockaddr { int unused; };
-struct sockaddr_in { int sin_family; int sin_port; struct { unsigned int s_addr; } sin_addr; };
-static int socket(int family, int type, int protocol) { (void)family; (void)type; (void)protocol; return 42; }
-static int bind(int descriptor, const struct sockaddr *address, size_t size) { (void)address; (void)size; assert(descriptor == 42); return -1; }
-static void closesocket(int descriptor) { assert(descriptor == 42); socket_closes++; }
-static int recvfrom(int descriptor, void *buf, size_t size, int flags, struct sockaddr *address, socklen_t *length)
+struct sockaddr_in { int sin_family,sin_port; struct { unsigned int s_addr; } sin_addr; };
+struct timeval { long tv_sec,tv_usec; };
+typedef struct { SOCKET socket; } fd_set;
+#define FD_ZERO(set) ((set)->socket=INVALID_SOCKET)
+#define FD_SET(sock,set) ((set)->socket=(sock))
+static SOCKET socket(int family,int type,int protocol)
 {
-	(void)descriptor; (void)buf; (void)size; (void)flags; (void)address; (void)length;
-	assert(!"recvfrom must not run after bind failure"); return -1;
+    (void)family;(void)type;(void)protocol;assert(lock_depth==1);
+    if(socket_fails) return INVALID_SOCKET;
+    assert(next_socket+1<1024);open_count++;return ++next_socket;
 }
-static int htons(int port) { return port; }
-static unsigned int htonl(unsigned int address) { return address; }
+static int bind(SOCKET fd,const struct sockaddr *addr,size_t size)
+{ (void)fd;(void)addr;(void)size;assert(lock_depth==1);return bind_fails?-1:0; }
+static int ioctlsocket(SOCKET fd,int command,u_long *value)
+{ (void)fd;(void)command;assert(*value==1);return nonblock_fails?-1:0; }
+static void closesocket(SOCKET fd)
+{ assert(fd!=INVALID_SOCKET&&fd<1024);assert(!closed[fd]);closed[fd]=true;close_count++; }
+static int select(int count,fd_set *set,void *write,void *error,struct timeval *timeout)
+{
+    (void)count;(void)write;(void)error;assert(lock_depth==0);assert(!closed[set->socket]);
+    assert(timeout->tv_sec==0&&timeout->tv_usec==100000);
+    if(ready_packets>0) { ready_packets--;return 1; }
+    /* Simulate another thread requesting shutdown while select times out. */
+    pthread_mutex_lock(&udp_servers_mutex);udp_shutdown=true;pthread_mutex_unlock(&udp_servers_mutex);return 0;
+}
+static int recvfrom(SOCKET fd,char *buf,size_t size,int flags,void *address,void *length)
+{
+    (void)flags;(void)address;(void)length;assert(!closed[fd]);assert(lock_depth==0);
+    if(receive_error) { last_error=receive_error;receive_error=0;return -1; }
+    size_t n=strlen(wire_packet);assert(n<size);memcpy(buf,wire_packet,n);return (int)n;
+}
+static int htons(unsigned short port) { return port; }
+static unsigned int htonl(unsigned int addr) { return addr; }
 static void os_set_thread_name(const char *name) { (void)name; }
 #define blog(...) ((void)0)
-@UDP_THREAD@
+@UDP_CODE@
 @DESTROY@
 @UPDATE@
 
 static struct move_filter new_filter(void)
 {
-	struct move_filter filter = {0};
-	filter.move_start_hotkey = OBS_INVALID_HOTKEY_ID;
-	filter.move_hold_hotkey = OBS_INVALID_HOTKEY_ID;
-	return filter;
+    struct move_filter filter={0};filter.move_start_hotkey=OBS_INVALID_HOTKEY_ID;filter.move_hold_hotkey=OBS_INVALID_HOTKEY_ID;return filter;
 }
-
-static void new_servers(size_t count)
+static void fixture(void)
 {
-	/* The guard makes the old wrong-index code skip a registration
-	 * deterministically, instead of depending on an out-of-bounds crash. */
-	udp_servers.array = calloc(count + 1, sizeof(*udp_servers.array));
-	assert(udp_servers.array);
-	udp_servers.num = count;
-	memset(stop_requests, 0, sizeof(stop_requests));
-	for (size_t i = 0; i < count; i++) udp_servers.array[i].port = (int)i;
+    assert(lock_depth==0);join_count=close_count=open_count=starts=stops=hotkeys_unregistered=waits=0;
+    socket_fails=bind_fails=nonblock_fails=thread_fails=reenter_update=false;
+    ready_packets=receive_error=last_error=thread_count=next_socket=0;wire_packet="go";
+    memset(threads,0,sizeof(threads));memset(closed,0,sizeof(closed));assert(move_filter_udp_init());
 }
-
-static void free_servers(void)
+static void finish(void)
 {
-	for (size_t i = 0; i < udp_servers.num; i++) {
-		da_free(udp_servers.array[i].start_triggers);
-		da_free(udp_servers.array[i].stop_triggers);
-	}
-	da_free(udp_servers);
-	assert(lock_depth == 0);
+    move_filter_udp_free();assert(join_count==thread_count);assert(close_count==open_count);assert(!udp_servers.num);
 }
-
-static void remove_filter(struct move_filter *filter, bool destroy)
+static void register_filter(struct move_filter *filter,int port,bool start)
 {
-	if (destroy) move_filter_destroy(filter);
-	else { obs_data_t settings = {0}; move_filter_update(filter, &settings); }
+    pthread_mutex_lock(&udp_servers_mutex);udp_update_trigger_locked(filter,port,start);pthread_mutex_unlock(&udp_servers_mutex);
 }
-
-static void test_multiple_triggers_on_one_server(bool destroy, bool stop_trigger)
+static void test_remove(bool destroy,bool stop_trigger)
 {
-	struct move_filter other = new_filter(), target = new_filter();
-	struct move_filter *a = &other, *b = &target;
-	new_servers(1);
-	if (stop_trigger) {
-		da_push_back(udp_servers.array[0].stop_triggers, &a);
-		da_push_back(udp_servers.array[0].stop_triggers, &b);
-	} else {
-		da_push_back(udp_servers.array[0].start_triggers, &a);
-		da_push_back(udp_servers.array[0].start_triggers, &b);
-	}
-	remove_filter(&target, destroy);
-	assert(udp_servers.array[0].start_triggers.num == (stop_trigger ? 0 : 1));
-	assert(udp_servers.array[0].stop_triggers.num == (stop_trigger ? 1 : 0));
-	assert(stop_requests[0] == 0);
-	free_servers();
-	if (!destroy) move_filter_destroy(&target);
+    fixture();struct move_filter other=new_filter(),target=new_filter();
+    register_filter(&other,3000,!stop_trigger);register_filter(&target,3000,!stop_trigger);
+    if(destroy)move_filter_destroy(&target);else { obs_data_t data={0};move_filter_update(&target,&data); }
+    struct udp_server *server=udp_servers.array[0];
+    assert(server->start_triggers.num==(stop_trigger?0:1));assert(server->stop_triggers.num==(stop_trigger?1:0));
+    if(!destroy)move_filter_destroy(&target);move_filter_destroy(&other);finish();
 }
-
-static void test_second_server_after_empty_first(bool destroy)
+static void test_unequal_servers(bool destroy,bool keep_stop)
 {
-	struct move_filter target = new_filter(); struct move_filter *p = &target;
-	new_servers(2);
-	da_push_back(udp_servers.array[1].start_triggers, &p);
-	da_push_back(udp_servers.array[1].stop_triggers, &p);
-	remove_filter(&target, destroy);
-	assert(udp_servers.array[1].start_triggers.num == 0);
-	assert(udp_servers.array[1].stop_triggers.num == 0);
-	assert(stop_requests[0] == 0 && stop_requests[1] == 1);
-	free_servers();
-	if (!destroy) move_filter_destroy(&target);
+    fixture();struct move_filter other=new_filter(),target=new_filter();
+    register_filter(&other,3000,true);register_filter(&target,3001,true);
+    if(keep_stop)register_filter(&other,3001,false);else register_filter(&target,3001,false);
+    register_filter(&other,0,true);
+    if(destroy)move_filter_destroy(&target);else { obs_data_t data={0};move_filter_update(&target,&data); }
+    assert(!udp_servers.array[1]->start_triggers.num);assert(udp_servers.array[1]->stop_triggers.num==(keep_stop?1:0));
+    if(!destroy)move_filter_destroy(&target);move_filter_destroy(&other);finish();
 }
-
-static void test_stop_uses_current_server(bool destroy)
+static void test_history(void)
 {
-	struct move_filter other = new_filter(), target = new_filter();
-	struct move_filter *a = &other, *b = &target;
-	new_servers(2);
-	da_push_back(udp_servers.array[0].start_triggers, &a);
-	da_push_back(udp_servers.array[1].start_triggers, &b);
-	da_push_back(udp_servers.array[1].stop_triggers, &a);
-	remove_filter(&target, destroy);
-	assert(udp_servers.array[1].start_triggers.num == 0);
-	assert(udp_servers.array[1].stop_triggers.num == 1);
-	assert(stop_requests[0] == 0 && stop_requests[1] == 0);
-	free_servers();
-	if (!destroy) move_filter_destroy(&target);
+    fixture();struct move_filter filter=new_filter();obs_source_t *source=NULL;da_push_back(filter.filters_done,&source);
+    filter.move_start_hotkey=1;filter.move_hold_hotkey=2;move_filter_destroy(&filter);
+    assert(!filter.filters_done.array&&!filter.filters_done.num);assert(hotkeys_unregistered==2);finish();
 }
-
-static void test_hotkey_history_is_freed(void)
+static void test_startup_failure(int failure)
 {
-	struct move_filter target = new_filter(); obs_source_t *source = NULL;
-	da_push_back(target.filters_done, &source);
-	target.move_start_hotkey = 1; target.move_hold_hotkey = 2;
-	move_filter_destroy(&target);
-	assert(target.filters_done.array == NULL && target.filters_done.num == 0);
-	assert(hotkeys_unregistered == 2);
+    fixture();struct move_filter filter=new_filter();
+    socket_fails=failure==0;bind_fails=failure==1;nonblock_fails=failure==2;thread_fails=failure==3;
+    register_filter(&filter,3000,true);assert(!udp_servers.num);assert(close_count==open_count);assert(thread_count==0);
+    socket_fails=bind_fails=nonblock_fails=thread_fails=false;
+    register_filter(&filter,3000,true);assert(udp_servers.num==1);move_filter_destroy(&filter);finish();
 }
-
-int main(int argc, char **argv)
+static void test_relocation_and_shutdown(void)
 {
-	const char *test = argc > 1 ? argv[1] : "all";
-	int scenarios = 0;
-	if (strcmp(test, "all") == 0 || strcmp(test, "udp") == 0) {
-		for (int destroy = 0; destroy <= 1; destroy++) {
-			test_multiple_triggers_on_one_server(destroy, false);
-			test_multiple_triggers_on_one_server(destroy, true);
-			test_second_server_after_empty_first(destroy);
-			test_stop_uses_current_server(destroy);
-			scenarios += 4;
-		}
-	}
-	if (strcmp(test, "all") == 0 || strcmp(test, "history") == 0) {
-		test_hotkey_history_is_freed(); scenarios++;
-	}
-	if (strcmp(test, "all") == 0 || strcmp(test, "bind") == 0) {
-		struct udp_server server = {0};
-		assert(udp_server_thread(&server) == NULL);
-		assert(socket_closes == 1); scenarios++;
-	}
-	assert(scenarios > 0);
-	printf("PASS: %d runtime regression scenarios (%s)\n", scenarios, test);
-	return 0;
+    fixture();struct move_filter filters[64];struct udp_server *first=NULL;
+    for(int i=0;i<64;i++) { filters[i]=new_filter();register_filter(&filters[i],3000+i,true);if(!i)first=udp_servers.array[0]; }
+    assert(udp_servers.array[0]==first);assert(threads[first->thread].arg==first);assert(first->port==3000);
+    move_filter_udp_shutdown();assert(join_count==64);assert(close_count==64);
+    register_filter(&filters[0],3999,true);assert(!udp_servers.num);assert(thread_count==64);
+    move_filter_udp_shutdown();for(int i=0;i<64;i++)move_filter_destroy(&filters[i]);finish();
+}
+static void test_reap_and_retry(void)
+{
+    fixture();struct move_filter filter=new_filter();register_filter(&filter,3000,true);struct udp_server *old=udp_servers.array[0];
+    register_filter(&filter,0,true);udp_server_thread(old);assert(old->finished&&old->socket==INVALID_SOCKET);
+    register_filter(&filter,3000,true);assert(udp_servers.num==2);assert(udp_servers.array[1]!=old);
+    udp_servers_reap();assert(join_count==1&&udp_servers.num==1);assert(udp_servers.array[0]->port==3000);
+    move_filter_destroy(&filter);finish();
+}
+static void test_dispatch(bool mismatch,bool transient,bool permanent)
+{
+    fixture();struct move_filter filter=new_filter();obs_source_t source={0};source.references=1;source.filter=&filter;
+    source.settings.packet=mismatch?"different":"go";filter.source=&source;register_filter(&filter,3000,true);
+    ready_packets=transient?2:1;receive_error=transient?WSAEWOULDBLOCK:(permanent?999:0);reenter_update=true;
+    udp_server_thread(udp_servers.array[0]);assert(source.references==1);assert(starts==((mismatch||permanent)?0:1));
+    assert(udp_servers.array[0]->finished);move_filter_destroy(&filter);finish();
+}
+int main(int argc,char **argv)
+{
+    const char *test=argc>1?argv[1]:"all";int scenarios=0;
+    if(!strcmp(test,"all")||!strcmp(test,"udp")) {
+        for(int destroy=0;destroy<=1;destroy++) {test_remove(destroy,false);test_remove(destroy,true);test_unequal_servers(destroy,false);test_unequal_servers(destroy,true);scenarios+=4;}
+    }
+    if(!strcmp(test,"all")||!strcmp(test,"history")) {test_history();scenarios++;}
+    if(!strcmp(test,"all")||!strcmp(test,"bind")) {test_startup_failure(1);scenarios++;}
+    if(!strcmp(test,"all")||!strcmp(test,"lifecycle")) {
+        test_startup_failure(0);test_startup_failure(2);test_startup_failure(3);
+        test_relocation_and_shutdown();test_reap_and_retry();
+        test_dispatch(false,false,false);test_dispatch(true,false,false);test_dispatch(false,true,false);test_dispatch(false,false,true);scenarios+=9;
+    }
+    assert(scenarios);printf("PASS: %d runtime regression scenarios (%s)\n",scenarios,test);return 0;
 }

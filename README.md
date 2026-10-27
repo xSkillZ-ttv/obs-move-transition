@@ -14,6 +14,8 @@ Move. OBS 33 is the minimum version for these Windows packages. The packaging al
 follows the layout announced for OBS 34; OBS 34 runtime compatibility has not been tested.
 
 See [CHANGES-OBS33.md](CHANGES-OBS33.md) for fixes and verification details.
+The preventive fixes cover filter cleanup, UDP socket failures, and UDP listener
+lifetime/shutdown. Automated Windows integration tests use an isolated OBS 33 runtime.
 
 # Installation
 

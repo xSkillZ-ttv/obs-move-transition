@@ -272,6 +272,9 @@ struct move_filter {
 };
 
 bool is_move_filter(const char *filter_id);
+bool move_filter_udp_init(void);
+void move_filter_udp_shutdown(void);
+void move_filter_udp_free(void);
 void move_filter_init(struct move_filter *move_filter, obs_source_t *source, void (*move_start)(void *data));
 void move_filter_destroy(struct move_filter *move_filter);
 void move_filter_update(struct move_filter *move_filter, obs_data_t *settings);
